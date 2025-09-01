@@ -113,6 +113,47 @@ class Rx90L:
             q = np.minimum(np.maximum(q, self.q_lim[:,0]), self.q_lim[:,1])
         return q
 
+    def ik_xyz_dir(self, q0, target_xyz, target_dir, d6=0.0, iters=100, lam=1e-2):
+        td = np.asarray(target_dir, float)
+        td = td / (np.linalg.norm(td) + 1e-12)
+
+        def err(q):
+            _, Ts = self._fk_Ts(q)
+            Te = Ts[-1].copy()
+            Te[:3, 3] += Te[:3, :3] @ np.array([0.0, 0.0, d6])
+            p = Te[:3, 3]
+            a = Te[:3, :3] @ np.array([0.0, 0.0, 1.0])
+            a_n = a / (np.linalg.norm(a) + 1e-12)
+            ex, ey, ez = p - target_xyz
+            c = np.cross(a_n, td)
+            return np.array([ex, ey, ez, c[0], c[1], c[2]])
+
+        q = q0.copy()
+        for _ in range(iters):
+            e, J = self._numerical_jacobian(err, q)
+            if np.linalg.norm(e[:3]) < 1e-4 and np.linalg.norm(e[3:]) < 1e-3:
+                break
+            JJt = J @ J.T
+            dq = J.T @ np.linalg.solve(JJt + (lam ** 2) * np.eye(JJt.shape[0]), -e)
+            q = q + dq
+            q = np.minimum(np.maximum(q, self.q_lim[:, 0]), self.q_lim[:, 1])
+        return q
+
+    @staticmethod
+    def rpy_to_dir(rpy):
+        """Convert roll-pitch-yaw angles to a unit direction vector."""
+        r, p, y = rpy
+        cr, sr = np.cos(r), np.sin(r)
+        cp, sp = np.cos(p), np.sin(p)
+        cy, sy = np.cos(y), np.sin(y)
+        # Rotation matrix for ZYX convention
+        R = np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ])
+        return R[:, 2]
+
     def build_xy_circle(self, center_xy=(0.6,0.0), radius=0.15, samples=240):
         t = np.linspace(0, 2*np.pi, samples, endpoint=False)
         xs = center_xy[0] + radius*np.cos(t)
@@ -136,175 +177,277 @@ class Rx90L:
     # Trajectory optimization demo (CasADi multiple shooting)
     # ------------------------------------------------------------------
     def ocp_demo(self):
+        import numpy as np
         try:
             import casadi as ca
         except ImportError:
             raise RuntimeError("CasADi is required for the OCP demo")
 
-        # Helper for DH in CasADi graph
+        # -----------------------------
+        # helpers (all defs included)
+        # -----------------------------
         def dh_T(a, alpha, d, theta):
             ca_, sa_ = ca.cos(alpha), ca.sin(alpha)
             ct, st = ca.cos(theta), ca.sin(theta)
             return ca.vertcat(
-                ca.horzcat(ct, -st*ca_,  st*sa_, a*ct),
-                ca.horzcat(st,  ct*ca_, -ct*sa_, a*st),
-                ca.horzcat(0,       sa_,     ca_,    d),
-                ca.horzcat(0,          0,       0,    1),
+                ca.horzcat(ct, -st * ca_, st * sa_, a * ct),
+                ca.horzcat(st, ct * ca_, -ct * sa_, a * st),
+                ca.horzcat(0, sa_, ca_, d),
+                ca.horzcat(0, 0, 0, 1),
             )
 
         def fk_pose(q):
             T = ca.SX.eye(4)
+            # robust to (hypothetical) prismatic entries
             for i, (a, alpha, d, theta0, is_rev) in enumerate(self.DH):
                 qi = q[i]
-                theta = theta0 + (qi if is_rev else 0.0)
-                T = ca.mtimes(T, dh_T(a, alpha, d, theta))
+                if is_rev:
+                    theta_i = theta0 + qi
+                    d_i = d
+                else:
+                    theta_i = theta0
+                    d_i = d + qi
+                T = ca.mtimes(T, dh_T(a, alpha, d_i, theta_i))
             return T
 
         def ee_pos(q):
-            return fk_pose(q)[0:3,3]
+            return fk_pose(q)[0:3, 3]
 
-        # Simplified placeholder dynamics
+        def rpy_to_dir_np(rpy_rad):
+            # tool z-axis in world for RPY (Z-Y-X)
+            roll, pitch, yaw = rpy_rad
+            cr, sr = np.cos(roll), np.sin(roll)
+            cp, sp = np.cos(pitch), np.sin(pitch)
+            cy, sy = np.cos(yaw), np.sin(yaw)
+            Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+            Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+            Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+            R = Rz @ Ry @ Rx
+            return R[:, 2]  # z-axis
+
+        def ik_xyz_dir_local(q0, target_p, target_dir, d6=0.10, iters=120, lam=2e-2):
+            td = np.asarray(target_dir, float)
+            td = td / (np.linalg.norm(td) + 1e-12)
+
+            def err(q):
+                _, Ts = self._fk_Ts(q)
+                Te = Ts[-1].copy()
+                p = (Te[:3, 3] + Te[:3, :3] @ np.array([0.0, 0.0, d6])).astype(float)
+                a = (Te[:3, :3] @ np.array([0.0, 0.0, 1.0])).astype(float)
+                a_n = a / (np.linalg.norm(a) + 1e-12)
+                epos = p - target_p
+                eori = np.cross(a_n, td)
+                return np.concatenate([epos, eori])
+
+            q = q0.copy()
+            for _ in range(iters):
+                y0, J = self._numerical_jacobian(err, q)  # uses class helper
+                if np.linalg.norm(y0[:3]) < 1e-4 and np.linalg.norm(y0[3:]) < 1e-3:
+                    break
+                JJt = J @ J.T
+                dq = J.T @ np.linalg.solve(JJt + (lam ** 2) * np.eye(JJt.shape[0]), -y0)
+                q = q + dq
+                q = np.minimum(np.maximum(q, self.q_lim[:, 0]), self.q_lim[:, 1])
+            return q
+
         def casadi_forward_dyn():
-            q  = ca.SX.sym("q",6)
-            dq = ca.SX.sym("dq",6)
-            tau= ca.SX.sym("tau",6)
+            q = ca.SX.sym("q", 6)
+            dq = ca.SX.sym("dq", 6)
+            tau = ca.SX.sym("tau", 6)
+
+            # Gravity via J^T Fg (cheap & more physical)
             p = ee_pos(q)
-            z = p[2]
-            w = ca.vertcat(1,0.9,0.7,0.4,0.2,0.1)
-            g_tau = 9.81*z*w
-            visc = ca.diag(ca.DM([2.0,2.0,1.5,0.6,0.4,0.2]))@dq
-            coul = ca.diag(ca.DM([2.5,2.0,1.5,0.8,0.6,0.3]))@ca.tanh(50*dq)
-            rhs = tau - visc - coul - g_tau
-            Minv = ca.diag(1.0/ca.DM([7.0,6.0,3.5,1.2,0.8,0.4]))
-            ddq = Minv @ rhs
-            return ca.Function("fd", [q,dq,tau], [ddq])
+            Jp = ca.jacobian(p, q)  # 3x6
+            m_eff = 3.0
+            Fg = ca.vertcat(0, 0, -9.81 * m_eff)
+            g_tau = ca.mtimes(Jp.T, Fg)  # 6x1
+
+            B = ca.DM([2.0, 2.0, 1.5, 0.6, 0.4, 0.2])  # visc
+            Cc = ca.DM([2.5, 2.0, 1.5, 0.8, 0.6, 0.3])  # Coulomb
+            visc = ca.diag(B) @ dq
+            coul = ca.diag(Cc) @ ca.tanh(50 * dq)
+
+            Minv = ca.diag(1.0 / ca.DM([7.0, 6.0, 3.5, 1.2, 0.8, 0.4]))
+            ddq = Minv @ (tau - visc - coul - g_tau)
+            return ca.Function("fd", [q, dq, tau], [ddq])
 
         fd = casadi_forward_dyn()
 
-        nq = 6
-        nx = 2*nq
+        def rk4_step(xk, uk, dt):
+            def f(x, u):
+                q, dq = x[0:nq], x[nq:2 * nq]
+                ddq = fd(q, dq, u)
+                return ca.vertcat(dq, ddq)
+
+            k1 = f(xk, uk)
+            k2 = f(xk + 0.5 * dt * k1, uk)
+            k3 = f(xk + 0.5 * dt * k2, uk)
+            k4 = f(xk + dt * k3, uk)
+            return xk + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+        # -----------------------------
+        # problem setup
+        # -----------------------------
+        nq = 6;
+        nx = 2 * nq;
         nu = nq
-        N  = 60
+        N = 60
         T_min, T_max = 2.0, 8.0
         T_sym = ca.SX.sym("T")
         dt = T_sym / N
-        X = ca.SX.sym("X", nx, N+1)
+        X = ca.SX.sym("X", nx, N + 1)
         U = ca.SX.sym("U", nu, N)
 
-        q_start = np.deg2rad(np.array([0, -30, 60, 0, 45, 0], float))
+        # Start/goal via IK (poses in meters & degrees for readability)
+        pose_start = np.array([0.6, 0.1, 0.50, 0.0, 0.0, 0.0], float)
+        pose_goal = np.array([0.8, 0.3, 0.50, 0.0, 0.0, 90.0], float)
+        dir_start = rpy_to_dir_np(np.deg2rad(pose_start[3:]))
+        dir_goal = rpy_to_dir_np(np.deg2rad(pose_goal[3:]))
+
+        # use class IK if you have it; else local fallback
+        if hasattr(self, "ik_xyz_dir"):
+            q_start = self.ik_xyz_dir(np.zeros(nq), pose_start[:3], dir_start, d6=0.10, iters=120, lam=2e-2)
+            q_goal = self.ik_xyz_dir(q_start, pose_goal[:3], dir_goal, d6=0.10, iters=120, lam=2e-2)
+        else:
+            q_start = ik_xyz_dir_local(np.zeros(nq), pose_start[:3], dir_start, d6=0.10, iters=120, lam=2e-2)
+            q_goal = ik_xyz_dir_local(q_start, pose_goal[:3], dir_goal, d6=0.10, iters=120, lam=2e-2)
         dq_start = np.zeros(nq)
-        q_goal  = np.deg2rad(np.array([30, -10, 40, 20, 30, -20], float))
         dq_goal = np.zeros(nq)
 
-        def rk4_step(xk, uk, dt):
-            qk  = xk[0:nq]
-            dqk = xk[nq:2*nq]
-            def f(x,u):
-                q, dq = x[0:nq], x[nq:2*nq]
-                ddq = fd(q,dq,u)
-                return ca.vertcat(dq,ddq)
-            k1 = f(xk,        uk)
-            k2 = f(xk+0.5*dt*k1, uk)
-            k3 = f(xk+0.5*dt*k2, uk)
-            k4 = f(xk+    dt*k3, uk)
-            return xk + (dt/6)*(k1+2*k2+2*k3+k4)
+        # -----------------------------
+        # constraints (defects enforced)
+        # -----------------------------
+        g_constr, g_l, g_u = [], [], []
 
-        g_constr = []
-        g_l = []
-        g_u = []
+        # initial
+        g_constr += [X[0:nq, 0] - ca.DM(q_start)];
+        g_l += [ca.DM.zeros(nq)];
+        g_u += [ca.DM.zeros(nq)]
+        g_constr += [X[nq:2 * nq, 0] - ca.DM(dq_start)];
+        g_l += [ca.DM.zeros(nq)];
+        g_u += [ca.DM.zeros(nq)]
+
+        # dynamics: multiple shooting defects
+        for k in range(N):
+            x_next = rk4_step(X[:, k], U[:, k], dt)
+            g_constr += [X[:, k + 1] - x_next]
+            g_l += [ca.DM.zeros(nx)]
+            g_u += [ca.DM.zeros(nx)]
+
+        # terminal
+        g_constr += [X[0:nq, -1] - ca.DM(q_goal)];
+        g_l += [ca.DM.zeros(nq)];
+        g_u += [ca.DM.zeros(nq)]
+        g_constr += [X[nq:2 * nq, -1] - ca.DM(dq_goal)];
+        g_l += [ca.DM.zeros(nq)];
+        g_u += [ca.DM.zeros(nq)]
+
+        # -----------------------------
+        # objective: energy + smoothness
+        # -----------------------------
+        W_mech, W_visc, W_i2r = 0 * 0.1, 0, 0 * 1e-3  # energy terms
+        W_du = 0 * 1e-1  # torque-rate smoothing
+        eps = 1e-6
+        Bvec = ca.DM([2.0, 2.0, 1.5, 0.6, 0.4, 0.2])  # reuse outside loop
+
         J = 0
-        W_tau, W_dq, W_track, W_T = 1e-3, 1e-4, 10.0, 1e-1
-
-        def build_task_path(N):
-            T0 = fk_pose(q_start)
-            p0 = np.array([float(T0[0,3]), float(T0[1,3]), max(0.2, float(T0[2,3]))])
-            radius = 0.12
-            ts = np.linspace(0, 2*np.pi, N+1)
-            Ps = []
-            for t in ts:
-                x = p0[0] + radius*np.cos(t)
-                y = p0[1] + radius*np.sin(t)
-                z = p0[2]
-                Ps.append(np.array([x,y,z]))
-            return np.array(Ps)
-
-        P_ref = build_task_path(N)
-
-        g_constr += [ X[0:nq,0]   - ca.DM(q_start) ]
-        g_l      += [ np.zeros(nq) ]
-        g_u      += [ np.zeros(nq) ]
-        g_constr += [ X[nq:2*nq,0] - ca.DM(dq_start) ]
-        g_l      += [ np.zeros(nq) ]
-        g_u      += [ np.zeros(nq) ]
-
         for k in range(N):
-            xk = X[:,k]
-            uk = U[:,k]
-            xk1 = rk4_step(xk, uk, dt)
-            g_constr += [ X[:,k+1] - xk1 ]
-            g_l += [ np.zeros(nx) ]
-            g_u += [ np.zeros(nx) ]
-            J += W_tau*ca.sumsqr(uk) + W_dq*ca.sumsqr(xk[nq:2*nq])
-            qk = xk[0:nq]
-            pk = ee_pos(qk)
-            pref = ca.DM(P_ref[k])
-            J += W_track*ca.sumsqr(pk - pref)
+            dqk = X[nq:2 * nq, k]
+            uk = U[:, k]
 
-        g_constr += [ X[0:nq,-1]   - ca.DM(q_goal) ]
-        g_l      += [ np.zeros(nq) ]
-        g_u      += [ np.zeros(nq) ]
-        g_constr += [ X[nq:2*nq,-1] - ca.DM(dq_goal) ]
-        g_l      += [ np.zeros(nq) ]
-        g_u      += [ np.zeros(nq) ]
+            pow_elem = uk * dqk
+            P_mech = ca.sum1(ca.sqrt(pow_elem * pow_elem + eps))  # Σ |τ_i ω_i|
+            P_visc = ca.dot(Bvec, dqk * dqk)  # Σ b_i ω_i^2
+            P_i2r = ca.dot(uk, uk)  # Σ τ_i^2
 
-        J += W_T*T_sym
+            stage = W_mech * P_mech + W_visc * P_visc + W_i2r * P_i2r
+            J += stage * dt
 
-        w = ca.vertcat(X.reshape((-1,1)), U.reshape((-1,1)), T_sym)
-        w_l = []
-        w_u = []
-        for k in range(N+1):
-            w_l += list(self.q_lim[:,0]); w_u += list(self.q_lim[:,1])
-            w_l += list(-np.deg2rad([356,356,296,409,480,1125]))
-            w_u += list( np.deg2rad([356,356,296,409,480,1125]))
-        for k in range(N):
-            w_l += list(-np.array([70,70,50,30,20,12]))
-            w_u += list( np.array([70,70,50,30,20,12]))
-        w_l += [T_min]; w_u += [T_max]
-        w_l = ca.DM(w_l); w_u = ca.DM(w_u)
+        # ∫ ||du/dt||^2 dt  ≈  Σ ||Δu||^2 / dt
+        J_du = 0
+        for k in range(1, N):
+            duk = U[:, k] - U[:, k - 1]
+            J_du += ca.dot(duk, duk) / dt
+        J += W_du * J_du
 
-        g = ca.vertcat(*[gc.reshape((-1,1)) for gc in g_constr])
-        g_l = ca.vertcat(*[ca.DM(gl).reshape((-1,1)) for gl in g_l])
-        g_u = ca.vertcat(*[ca.DM(gu).reshape((-1,1)) for gu in g_u])
+        # -----------------------------
+        # decision vector, bounds, init
+        # -----------------------------
+        w = ca.vertcat(X.reshape((-1, 1)), U.reshape((-1, 1)), T_sym)
 
+        w_l, w_u = [], []
+        for _ in range(N + 1):
+            w_l += list(self.q_lim[:, 0]);
+            w_u += list(self.q_lim[:, 1])  # q
+            w_l += list(-np.deg2rad([356, 356, 296, 409, 480, 1125]))  # dq min
+            w_u += list(np.deg2rad([356, 356, 296, 409, 480, 1125]))  # dq max
+        for _ in range(N):
+            w_l += list(-np.array([70, 70, 50, 30, 20, 12]))  # tau min
+            w_u += list(np.array([70, 70, 50, 30, 20, 12]))  # tau max
+        w_l += [T_min];
+        w_u += [T_max]  # time window
+        w_l = ca.DM(w_l);
+        w_u = ca.DM(w_u)
+
+        g = ca.vertcat(*[gc.reshape((-1, 1)) for gc in g_constr])
+
+        # all constraints are equalities → g == 0
+        g_l = ca.DM.zeros(g.size1(), 1)
+        g_u = ca.DM.zeros(g.size1(), 1)
+
+        # smooth quintic seed in joint space
+        T0 = 0.5 * (T_min + T_max)
         w0 = []
-        for k in range(N+1):
-            alpha = k/float(N)
-            qg = (1-alpha)*q_start + alpha*q_goal
-            w0 += list(qg); w0 += list((1-alpha)*dq_start + alpha*dq_goal)
-        for k in range(N):
-            w0 += list(np.zeros(nu))
-        w0 += [(T_min+T_max)/2]
+        for k in range(N + 1):
+            s = k / float(N)
+            sigma = 10 * s ** 3 - 15 * s ** 4 + 6 * s ** 5
+            dsigma = (30 * s ** 2 - 60 * s ** 3 + 30 * s ** 4) / T0
+            qk = q_start + sigma * (q_goal - q_start)
+            dqk = dsigma * (q_goal - q_start)
+            w0 += list(qk);
+            w0 += list(dqk)
+        for _ in range(N):
+            w0 += [0.0] * nu
+        w0 += [T0]
         w0 = ca.DM(w0)
 
+        # -----------------------------
+        # solve
+        # -----------------------------
         nlp = {"x": w, "f": J, "g": g}
-        opts = {"ipopt": {"print_level": 0, "max_iter": 500}}
+        opts = {"ipopt": {
+            "print_level": 0, "max_iter": 800,
+            "mu_strategy": "adaptive",
+            "linear_solver": "mumps",
+            "tol": 1e-5, "acceptable_tol": 1e-4
+        }}
         solver = ca.nlpsol("solver", "ipopt", nlp, opts)
         sol = solver(x0=w0, lbx=w_l, ubx=w_u, lbg=g_l, ubg=g_u)
         w_opt = sol["x"].full().flatten()
 
+        # debug
+        stats = solver.stats()
+        print("status:", stats.get("return_status"))
+        print("iter:", stats.get("iter_count"))
+        print("obj:", float(sol["f"]))
+        print("T_opt:", float(w_opt[-1]))
+
+        # unpack
         idx = 0
-        X_opt = np.zeros((nx, N+1))
+        X_opt = np.zeros((nx, N + 1))
         U_opt = np.zeros((nu, N))
-        for k in range(N+1):
-            X_opt[:,k] = w_opt[idx:idx+nx]; idx += nx
+        for k in range(N + 1):
+            X_opt[:, k] = w_opt[idx:idx + nx];
+            idx += nx
         for k in range(N):
-            U_opt[:,k] = w_opt[idx:idx+nu]; idx += nu
+            U_opt[:, k] = w_opt[idx:idx + nu];
+            idx += nu
         T_opt = w_opt[idx]
 
-        q_opt  = X_opt[0:nq,:]
-        dq_opt = X_opt[nq:2*nq,:]
-        tau_opt= U_opt
-        tgrid = np.linspace(0, float(T_opt), N+1)
+        q_opt = X_opt[0:nq, :].T
+        dq_opt = X_opt[nq:2 * nq, :].T
+        tau_opt = U_opt.T
+        tgrid = np.linspace(0, float(T_opt), N + 1)
         return {"q": q_opt, "dq": dq_opt, "tau": tau_opt, "tgrid": tgrid, "T": T_opt}
 
     # ------------------------------------------------------------------
@@ -350,11 +493,11 @@ class Rx90L:
 
     def plot_trajectory(self, tgrid, q, dq=None, tau=None):
         fig, axs = plt.subplots(3,1,figsize=(10,8), sharex=True)
-        axs[0].plot(tgrid, np.rad2deg(q).T); axs[0].set_ylabel('q [deg]')
+        axs[0].plot(tgrid, np.rad2deg(q)); axs[0].set_ylabel('q [deg]')
         if dq is not None:
-            axs[1].plot(tgrid, np.rad2deg(dq).T); axs[1].set_ylabel('dq [deg/s]')
+            axs[1].plot(tgrid, np.rad2deg(dq)); axs[1].set_ylabel('dq [deg/s]')
         if tau is not None:
-            axs[2].plot(tgrid[:-1], tau.T); axs[2].set_ylabel('tau [Nm]')
+            axs[2].plot(tgrid[:-1], tau); axs[2].set_ylabel('tau [Nm]')
         axs[2].set_xlabel('t [s]')
         for ax in axs:
             ax.grid(True)
