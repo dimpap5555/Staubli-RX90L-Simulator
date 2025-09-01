@@ -154,7 +154,8 @@ class Rx90L:
 
         def fk_pose(q):
             T = ca.SX.eye(4)
-            for (a, alpha, d, theta0, is_rev), qi in zip(self.DH, q):
+            for i, (a, alpha, d, theta0, is_rev) in enumerate(self.DH):
+                qi = q[i]
                 theta = theta0 + (qi if is_rev else 0.0)
                 T = ca.mtimes(T, dh_T(a, alpha, d, theta))
             return T
